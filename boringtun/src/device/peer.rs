@@ -10,10 +10,13 @@ use std::str::FromStr;
 use crate::device::{AllowedIps, Error};
 use crate::noise::{Tunn, TunnResult};
 
+use super::socket_ctx::SocketContext;
+
 #[derive(Default, Debug)]
 pub struct Endpoint {
     pub addr: Option<SocketAddr>,
     pub conn: Option<socket2::Socket>,
+    pub ctx: Option<SocketContext>,
 }
 
 pub struct Peer {
@@ -64,6 +67,7 @@ impl Peer {
             endpoint: RwLock::new(Endpoint {
                 addr: endpoint,
                 conn: None,
+                ctx: None,
             }),
             allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
             preshared_key,
@@ -89,15 +93,23 @@ impl Peer {
         }
     }
 
-    pub fn set_endpoint(&self, addr: SocketAddr) {
+    pub fn set_endpoint(&self, addr: SocketAddr, ctx: Option<SocketContext>) {
         let mut endpoint = self.endpoint.write();
-        if endpoint.addr != Some(addr) {
-            // We only need to update the endpoint if it differs from the current one
+
+        let addr_changed = endpoint.addr != Some(addr);
+        let ifindex_changed =
+            endpoint.ctx.as_ref().map(|c| c.ifindex()) != ctx.as_ref().map(|c| c.ifindex());
+
+        if addr_changed || ifindex_changed {
+            // We only need to update the endpoint if it differs from the
+            // current one, or it roamed to a different interface while keeping
+            // the same source IP:
             if let Some(conn) = endpoint.conn.take() {
                 conn.shutdown(Shutdown::Both).unwrap();
             }
 
             endpoint.addr = Some(addr);
+            endpoint.ctx = ctx;
         }
     }
 
@@ -119,12 +131,32 @@ impl Peer {
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         udp_conn.set_reuse_address(true)?;
+
+        let ifindex = endpoint.ctx.as_ref().map(SocketContext::ifindex);
+
         let bind_addr = if addr.is_ipv4() {
             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into()
         } else {
             SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into()
         };
         udp_conn.bind(&bind_addr)?;
+
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if let Some(index) = ifindex {
+            use std::ffi::CStr;
+            let mut buf = [0u8; libc::IF_NAMESIZE];
+            let ptr = unsafe { libc::if_indextoname(index, buf.as_mut_ptr() as *mut libc::c_char) };
+
+            if ptr.is_null() {
+                return Err(Error::Connect(format!(
+                    "Invalid interface index: {}",
+                    index
+                )));
+            }
+            let name = unsafe { CStr::from_ptr(ptr) };
+            udp_conn.bind_device(Some(name.to_bytes()))?;
+        }
+
         udp_conn.connect(&addr.into())?;
         udp_conn.set_nonblocking(true)?;
 
@@ -136,7 +168,8 @@ impl Peer {
         tracing::info!(
             message="Connected endpoint",
             port=port,
-            endpoint=?endpoint.addr.unwrap()
+            endpoint=?endpoint.addr.unwrap(),
+            ifindex=?ifindex,
         );
 
         endpoint.conn = Some(udp_conn.try_clone().unwrap());

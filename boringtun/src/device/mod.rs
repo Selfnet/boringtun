@@ -4,6 +4,8 @@
 pub mod allowed_ips;
 pub mod api;
 mod dev_lock;
+mod socket_ctx;
+use socket_ctx::send_with_ctx;
 pub mod drop_privileges;
 #[cfg(test)]
 mod integration_tests;
@@ -29,7 +31,7 @@ use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -430,6 +432,17 @@ impl Device {
         udp_sock4.set_reuse_address(true)?;
         udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
         udp_sock4.set_nonblocking(true)?;
+        nix::sys::socket::setsockopt(
+            &unsafe { BorrowedFd::borrow_raw(udp_sock4.as_raw_fd()) },
+            nix::sys::socket::sockopt::Ipv4PacketInfo,
+            &true,
+        )
+        .map_err(|errno| {
+            Error::SetSockOpt(format!(
+                "Failed to enable Ipv4PacketInfo on udp_sock4: {:?}",
+                errno
+            ))
+        })?;
 
         if port == 0 {
             // Random port was assigned
@@ -440,6 +453,17 @@ impl Device {
         udp_sock6.set_reuse_address(true)?;
         udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp_sock6.set_nonblocking(true)?;
+        nix::sys::socket::setsockopt(
+            &unsafe { BorrowedFd::borrow_raw(udp_sock6.as_raw_fd()) },
+            nix::sys::socket::sockopt::Ipv6RecvPacketInfo,
+            &true,
+        )
+        .map_err(|errno| {
+            Error::SetSockOpt(format!(
+                "Failed to enable Ipv6RecvPacketInfo on udp_sock4: {:?}",
+                errno
+            ))
+        })?;
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
@@ -557,12 +581,20 @@ impl Device {
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
                             match endpoint_addr {
-                                SocketAddr::V4(_) => {
-                                    udp4.send_to(packet, &endpoint_addr.into()).ok()
-                                }
-                                SocketAddr::V6(_) => {
-                                    udp6.send_to(packet, &endpoint_addr.into()).ok()
-                                }
+                                SocketAddr::V4(_) => send_with_ctx(
+                                    udp4,
+                                    packet,
+                                    &endpoint_addr.into(),
+                                    p.endpoint().ctx.as_ref(),
+                                )
+                                .ok(),
+                                SocketAddr::V6(_) => send_with_ctx(
+                                    udp6,
+                                    packet,
+                                    &endpoint_addr.into(),
+                                    p.endpoint().ctx.as_ref(),
+                                )
+                                .ok(),
                             };
                         }
                         _ => panic!("Unexpected result from update_timers"),
@@ -601,12 +633,9 @@ impl Device {
                 let rate_limiter = d.rate_limiter.as_ref().unwrap();
 
                 // Loop while we have packets on the anonymous connection
-
-                // Safety: the `recv_from` implementation promises not to write uninitialised
-                // bytes to the buffer, so this casting is safe.
-                let src_buf =
-                    unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                while let Ok((packet_len, addr, socket_ctx)) =
+                    socket_ctx::recv_with_ctx(&udp, &mut t.src_buf[..])
+                {
                     let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
@@ -616,7 +645,8 @@ impl Device {
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
-                            let _: Result<_, _> = udp.send_to(cookie, &addr);
+                            let _: Result<_, _> =
+                                send_with_ctx(&udp, cookie, &addr, socket_ctx.as_ref());
                             continue;
                         }
                         Err(_) => continue,
@@ -652,7 +682,8 @@ impl Device {
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
                             flush = true;
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                            let _: Result<_, _> =
+                                send_with_ctx(&udp, packet, &addr, socket_ctx.as_ref());
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
                             if p.is_allowed_ip(addr) {
@@ -671,14 +702,15 @@ impl Device {
                         while let TunnResult::WriteToNetwork(packet) =
                             p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
                         {
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                            let _: Result<_, _> =
+                                send_with_ctx(&udp, packet, &addr, socket_ctx.as_ref());
                         }
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let addr = addr.as_socket().unwrap();
                     let ip_addr = addr.ip();
-                    p.set_endpoint(addr);
+                    p.set_endpoint(addr, socket_ctx);
                     if d.config.use_connected_socket {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
@@ -817,9 +849,19 @@ impl Device {
                                 // Prefer to send using the connected socket
                                 let _: Result<_, _> = conn.write(packet);
                             } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                                let _: Result<_, _> = send_with_ctx(
+                                    udp4,
+                                    packet,
+                                    &addr.into(),
+                                    endpoint.ctx.as_ref(),
+                                );
                             } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                                let _: Result<_, _> = send_with_ctx(
+                                    udp6,
+                                    packet,
+                                    &addr.into(),
+                                    endpoint.ctx.as_ref(),
+                                );
                             } else {
                                 tracing::error!("No endpoint");
                             }
