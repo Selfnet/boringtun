@@ -284,6 +284,7 @@ fn api_set_peer(
     let mut cmd = String::new();
 
     let mut remove = false;
+    let mut update_only = false;
     let mut replace_ips = false;
     let mut endpoint = None;
     let mut keepalive = None;
@@ -296,6 +297,7 @@ fn api_set_peer(
             d.update_peer(
                 public_key,
                 remove,
+                update_only,
                 replace_ips,
                 endpoint,
                 allowed_ips.as_slice(),
@@ -315,6 +317,10 @@ fn api_set_peer(
                 "remove" => match val.parse::<bool>() {
                     Ok(true) => remove = true,
                     Ok(false) => remove = false,
+                    Err(_) => return EINVAL,
+                },
+                "update_only" => match val.parse::<bool>() {
+                    Ok(value) => update_only = value,
                     Err(_) => return EINVAL,
                 },
                 "preshared_key" => match val.parse::<KeyBytes>() {
@@ -343,17 +349,28 @@ fn api_set_peer(
                     d.update_peer(
                         public_key,
                         remove,
+                        update_only,
                         replace_ips,
                         endpoint,
                         allowed_ips.as_slice(),
                         keepalive,
                         preshared_key,
                     );
-                    allowed_ips.clear(); //clear the vector content after update
                     match val.parse::<KeyBytes>() {
                         Ok(key_bytes) => public_key = key_bytes.0.into(),
                         Err(_) => return EINVAL,
                     }
+
+                    // Every option above is scoped to a single peer section.
+                    // Retaining any of it would apply one peer's settings to
+                    // the peer following it in the same UAPI request.
+                    remove = false;
+                    update_only = false;
+                    replace_ips = false;
+                    endpoint = None;
+                    keepalive = None;
+                    preshared_key = None;
+                    allowed_ips.clear();
                 }
                 "protocol_version" => match val.parse::<u32>() {
                     Ok(1) => {} // Only version 1 is legal
