@@ -113,6 +113,21 @@ impl Peer {
         }
     }
 
+    /// Apply an endpoint received through configuration. If the address has
+    /// not changed, retain any interface context learned from live traffic.
+    pub fn set_config_endpoint(&self, addr: SocketAddr) {
+        let mut endpoint = self.endpoint.write();
+
+        if endpoint.addr != Some(addr) {
+            if let Some(conn) = endpoint.conn.take() {
+                let _ = conn.shutdown(Shutdown::Both);
+            }
+
+            endpoint.addr = Some(addr);
+            endpoint.ctx = None;
+        }
+    }
+
     pub fn connect_endpoint(
         &self,
         port: u16,
@@ -185,6 +200,20 @@ impl Peer {
         self.allowed_ips.iter().map(|(_, ip, cidr)| (ip, cidr))
     }
 
+    pub(crate) fn clear_allowed_ips(&mut self) {
+        self.allowed_ips.clear();
+    }
+
+    pub(crate) fn add_allowed_ip(&mut self, allowed_ip: AllowedIP) {
+        self.allowed_ips
+            .insert(allowed_ip.addr, allowed_ip.cidr as _, ());
+    }
+
+    pub(crate) fn remove_allowed_ip(&mut self, allowed_ip: AllowedIP) {
+        self.allowed_ips
+            .remove_exact(allowed_ip.addr, allowed_ip.cidr as _);
+    }
+
     pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
         self.tunnel.time_since_last_handshake()
     }
@@ -193,8 +222,17 @@ impl Peer {
         self.tunnel.persistent_keepalive()
     }
 
+    pub(crate) fn set_persistent_keepalive(&mut self, persistent_keepalive: Option<u16>) {
+        self.tunnel.set_persistent_keepalive(persistent_keepalive);
+    }
+
     pub fn preshared_key(&self) -> Option<&[u8; 32]> {
         self.preshared_key.as_ref()
+    }
+
+    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        self.tunnel.set_preshared_key(preshared_key);
+        self.preshared_key = preshared_key;
     }
 
     pub fn index(&self) -> u32 {

@@ -281,6 +281,76 @@ impl Drop for DeviceHandle {
     }
 }
 
+fn normalized_preshared_key(preshared_key: [u8; 32]) -> Option<[u8; 32]> {
+    if preshared_key == [0u8; 32] {
+        None
+    } else {
+        Some(preshared_key)
+    }
+}
+
+fn insert_allowed_ip(
+    peers_by_ip: &mut AllowedIps<Arc<Mutex<Peer>>>,
+    peer: &Arc<Mutex<Peer>>,
+    allowed_ip: AllowedIP,
+) {
+    let previous_peer = peers_by_ip.insert(allowed_ip.addr, allowed_ip.cidr as _, Arc::clone(peer));
+
+    if let Some(previous_peer) = previous_peer {
+        if !Arc::ptr_eq(&previous_peer, peer) {
+            previous_peer.lock().remove_allowed_ip(allowed_ip);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_existing_peer(
+    peer: &Arc<Mutex<Peer>>,
+    peers_by_ip: &mut AllowedIps<Arc<Mutex<Peer>>>,
+    replace_ips: bool,
+    endpoint: Option<SocketAddr>,
+    allowed_ips: &[AllowedIP],
+    keepalive: Option<u16>,
+    preshared_key: Option<[u8; 32]>,
+) {
+    if replace_ips {
+        peers_by_ip.remove(&|entry| Arc::ptr_eq(entry, peer));
+    }
+
+    {
+        let mut peer_guard = peer.lock();
+
+        if replace_ips {
+            peer_guard.clear_allowed_ips();
+        }
+
+        for allowed_ip in allowed_ips {
+            peer_guard.add_allowed_ip(*allowed_ip);
+        }
+
+        if let Some(endpoint) = endpoint {
+            peer_guard.set_config_endpoint(endpoint);
+        }
+
+        if let Some(keepalive) = keepalive {
+            let keepalive = if keepalive == 0 {
+                None
+            } else {
+                Some(keepalive)
+            };
+            peer_guard.set_persistent_keepalive(keepalive);
+        }
+
+        if let Some(preshared_key) = preshared_key {
+            peer_guard.set_preshared_key(normalized_preshared_key(preshared_key));
+        }
+    }
+
+    for allowed_ip in allowed_ips {
+        insert_allowed_ip(peers_by_ip, peer, *allowed_ip);
+    }
+}
+
 impl Device {
     fn next_index(&mut self) -> u32 {
         self.next_index.next()
@@ -306,22 +376,38 @@ impl Device {
         &mut self,
         pub_key: x25519::PublicKey,
         remove: bool,
-        _replace_ips: bool,
+        update_only: bool,
+        replace_ips: bool,
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
         preshared_key: Option<[u8; 32]>,
     ) {
+        if update_only && !self.peers.contains_key(&pub_key) {
+            return;
+        }
+
         if remove {
             // Completely remove a peer
             return self.remove_peer(&pub_key);
         }
 
-        // Update an existing peer
-        if self.peers.get(&pub_key).is_some() {
-            // We already have a peer, we need to merge the existing config into the newly created one
-            panic!("Modifying existing peers is not yet supported. Remove and add again instead.");
+        if let Some(peer) = self.peers.get(&pub_key).cloned() {
+            update_existing_peer(
+                &peer,
+                &mut self.peers_by_ip,
+                replace_ips,
+                endpoint,
+                allowed_ips,
+                keepalive,
+                preshared_key,
+            );
+
+            tracing::info!("Peer updated");
+            return;
         }
+
+        let preshared_key = preshared_key.and_then(normalized_preshared_key);
 
         let next_index = self.next_index();
         let device_key_pair = self
@@ -344,9 +430,8 @@ impl Device {
         self.peers.insert(pub_key, Arc::clone(&peer));
         self.peers_by_idx.insert(next_index, Arc::clone(&peer));
 
-        for AllowedIP { addr, cidr } in allowed_ips {
-            self.peers_by_ip
-                .insert(*addr, *cidr as _, Arc::clone(&peer));
+        for allowed_ip in allowed_ips {
+            insert_allowed_ip(&mut self.peers_by_ip, &peer, *allowed_ip);
         }
 
         tracing::info!("Peer added");
@@ -523,9 +608,11 @@ impl Device {
     }
 
     fn clear_peers(&mut self) {
-        self.peers.clear();
-        self.peers_by_idx.clear();
-        self.peers_by_ip.clear();
+        let public_keys: Vec<_> = self.peers.keys().cloned().collect();
+
+        for public_key in public_keys {
+            self.remove_peer(&public_key);
+        }
     }
 
     fn register_notifiers(&mut self) -> Result<(), Error> {
@@ -922,5 +1009,175 @@ impl Default for IndexLfsr {
             lfsr: seed,
             mask: Self::random_index(),
         }
+    }
+}
+
+#[cfg(test)]
+mod peer_update_tests {
+    use super::*;
+
+    fn allowed_ip(value: &str) -> AllowedIP {
+        value.parse().unwrap()
+    }
+
+    fn make_peer(
+        allowed_ips: &[AllowedIP],
+        endpoint: SocketAddr,
+        keepalive: Option<u16>,
+        preshared_key: Option<[u8; 32]>,
+    ) -> Arc<Mutex<Peer>> {
+        let private_key = x25519::StaticSecret::from([1u8; 32]);
+        let peer_private_key = x25519::StaticSecret::from([2u8; 32]);
+        let peer_public_key = x25519::PublicKey::from(&peer_private_key);
+        let index = 42;
+        let tunnel = Tunn::new(
+            private_key,
+            peer_public_key,
+            preshared_key,
+            keepalive,
+            index,
+            None,
+        );
+
+        Arc::new(Mutex::new(Peer::new(
+            tunnel,
+            index,
+            Some(endpoint),
+            allowed_ips,
+            preshared_key,
+        )))
+    }
+
+    #[test]
+    fn existing_peer_update_replaces_only_requested_fields() {
+        let old_allowed_ip = allowed_ip("10.0.0.0/24");
+        let new_allowed_ip = allowed_ip("10.1.0.0/24");
+        let old_endpoint: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let new_endpoint: SocketAddr = "192.0.2.2:51821".parse().unwrap();
+        let peer = make_peer(&[old_allowed_ip], old_endpoint, Some(25), Some([7u8; 32]));
+
+        let mut peers_by_ip = AllowedIps::new();
+        peers_by_ip.insert(
+            old_allowed_ip.addr,
+            old_allowed_ip.cidr.into(),
+            Arc::clone(&peer),
+        );
+
+        update_existing_peer(
+            &peer,
+            &mut peers_by_ip,
+            true,
+            Some(new_endpoint),
+            &[new_allowed_ip],
+            Some(0),
+            Some([0u8; 32]),
+        );
+
+        let peer_guard = peer.lock();
+        assert_eq!(peer_guard.index(), 42);
+        assert_eq!(peer_guard.endpoint().addr, Some(new_endpoint));
+        assert_eq!(peer_guard.persistent_keepalive(), None);
+        assert_eq!(peer_guard.preshared_key(), None);
+        assert!(!peer_guard.is_allowed_ip(IpAddr::from([10, 0, 0, 1])));
+        assert!(peer_guard.is_allowed_ip(IpAddr::from([10, 1, 0, 1])));
+        drop(peer_guard);
+
+        assert!(peers_by_ip.find(IpAddr::from([10, 0, 0, 1])).is_none());
+        assert!(Arc::ptr_eq(
+            peers_by_ip.find(IpAddr::from([10, 1, 0, 1])).unwrap(),
+            &peer
+        ));
+
+        // Repeating the same syncconf must be idempotent.
+        update_existing_peer(
+            &peer,
+            &mut peers_by_ip,
+            true,
+            Some(new_endpoint),
+            &[new_allowed_ip],
+            Some(0),
+            Some([0u8; 32]),
+        );
+        assert_eq!(peer.lock().allowed_ips().count(), 1);
+    }
+
+    #[test]
+    fn omitted_peer_fields_are_preserved_and_allowed_ips_are_merged() {
+        let old_allowed_ip = allowed_ip("10.0.0.0/24");
+        let added_allowed_ip = allowed_ip("2001:db8::/64");
+        let endpoint: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let preshared_key = [7u8; 32];
+        let peer = make_peer(&[old_allowed_ip], endpoint, Some(25), Some(preshared_key));
+
+        let mut peers_by_ip = AllowedIps::new();
+        peers_by_ip.insert(
+            old_allowed_ip.addr,
+            old_allowed_ip.cidr.into(),
+            Arc::clone(&peer),
+        );
+
+        update_existing_peer(
+            &peer,
+            &mut peers_by_ip,
+            false,
+            None,
+            &[added_allowed_ip],
+            None,
+            None,
+        );
+
+        let peer_guard = peer.lock();
+        assert_eq!(peer_guard.endpoint().addr, Some(endpoint));
+        assert_eq!(peer_guard.persistent_keepalive(), Some(25));
+        assert_eq!(peer_guard.preshared_key(), Some(&preshared_key));
+        assert!(peer_guard.is_allowed_ip(IpAddr::from([10, 0, 0, 1])));
+        assert!(peer_guard.is_allowed_ip("2001:db8::1".parse::<IpAddr>().unwrap()));
+        drop(peer_guard);
+
+        assert!(Arc::ptr_eq(
+            peers_by_ip.find(IpAddr::from([10, 0, 0, 1])).unwrap(),
+            &peer
+        ));
+        assert!(Arc::ptr_eq(
+            peers_by_ip
+                .find("2001:db8::1".parse::<IpAddr>().unwrap())
+                .unwrap(),
+            &peer
+        ));
+    }
+
+    #[test]
+    fn identical_allowed_ip_is_moved_from_its_previous_peer() {
+        let shared_allowed_ip = allowed_ip("10.0.0.0/24");
+        let first_endpoint: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let second_endpoint: SocketAddr = "192.0.2.2:51820".parse().unwrap();
+        let first_peer = make_peer(&[shared_allowed_ip], first_endpoint, None, None);
+        let second_peer = make_peer(&[], second_endpoint, None, None);
+
+        let mut peers_by_ip = AllowedIps::new();
+        peers_by_ip.insert(
+            shared_allowed_ip.addr,
+            shared_allowed_ip.cidr.into(),
+            Arc::clone(&first_peer),
+        );
+
+        update_existing_peer(
+            &second_peer,
+            &mut peers_by_ip,
+            false,
+            None,
+            &[shared_allowed_ip],
+            None,
+            None,
+        );
+
+        assert!(!first_peer.lock().is_allowed_ip(IpAddr::from([10, 0, 0, 1])));
+        assert!(second_peer
+            .lock()
+            .is_allowed_ip(IpAddr::from([10, 0, 0, 1])));
+        assert!(Arc::ptr_eq(
+            peers_by_ip.find(IpAddr::from([10, 0, 0, 1])).unwrap(),
+            &second_peer
+        ));
     }
 }

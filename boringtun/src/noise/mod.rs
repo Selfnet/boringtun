@@ -241,6 +241,12 @@ impl Tunn {
         }
     }
 
+    /// Update the preshared key used by future handshakes without invalidating
+    /// already-established transport sessions.
+    pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        self.handshake.set_preshared_key(preshared_key);
+    }
+
     /// Encapsulate a single packet from the tunnel interface.
     /// Returns TunnResult.
     ///
@@ -790,5 +796,46 @@ mod tests {
             unreachable!();
         };
         assert_eq!(sent_packet_buf, recv_packet_buf);
+    }
+
+    #[test]
+    fn runtime_peer_updates_preserve_established_session() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut my_dst = [0u8; 1024];
+        let mut their_dst = [0u8; 1024];
+        let sent_packet = create_ipv4_udp_packet();
+
+        my_tun.set_preshared_key(Some([7u8; 32]));
+        my_tun.set_persistent_keepalive(Some(25));
+
+        assert_eq!(my_tun.persistent_keepalive(), Some(25));
+        assert!(my_tun.time_since_last_handshake().is_some());
+
+        let encrypted = match my_tun.encapsulate(&sent_packet, &mut my_dst) {
+            TunnResult::WriteToNetwork(packet) => packet,
+            result => panic!("unexpected encapsulation result: {:?}", result),
+        };
+        let decrypted = their_tun.decapsulate(None, encrypted, &mut their_dst);
+        let received = match decrypted {
+            TunnResult::WriteToTunnelV4(packet, _) => packet,
+            result => panic!("unexpected decapsulation result: {:?}", result),
+        };
+
+        assert_eq!(received, sent_packet);
+
+        // Once the other side has the same PSK, future handshakes use it.
+        their_tun.set_preshared_key(Some([7u8; 32]));
+        #[cfg(feature = "mock-instant")]
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        let init = create_handshake_init(&mut my_tun);
+        let response = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &response);
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        my_tun.set_preshared_key(None);
+        their_tun.set_preshared_key(None);
+        my_tun.set_persistent_keepalive(None);
+        assert_eq!(my_tun.persistent_keepalive(), None);
+        assert!(my_tun.time_since_last_handshake().is_some());
     }
 }

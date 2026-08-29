@@ -479,6 +479,15 @@ impl Handshake {
         self.params.set_static_private(private_key, public_key)
     }
 
+    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        self.params.preshared_key = preshared_key;
+
+        // An in-progress handshake may have used the previous PSK.
+        // Established transport sessions are deliberately preserved.
+        self.previous = HandshakeState::None;
+        self.state = HandshakeState::None;
+    }
+
     pub(super) fn receive_handshake_initialization<'a>(
         &mut self,
         packet: HandshakeInit,

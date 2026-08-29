@@ -332,4 +332,10 @@ impl Tunn {
             None
         }
     }
+
+    /// Change the persistent keepalive interval without disturbing the
+    /// tunnel's handshake or transport sessions.
+    pub fn set_persistent_keepalive(&mut self, persistent_keepalive: Option<u16>) {
+        self.timers.persistent_keepalive = usize::from(persistent_keepalive.unwrap_or_default());
+    }
 }

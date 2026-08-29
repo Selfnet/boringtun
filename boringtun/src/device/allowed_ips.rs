@@ -64,6 +64,10 @@ impl<D> AllowedIps<D> {
                 .collect(),
         )
     }
+    pub fn remove_exact(&mut self, key: IpAddr, cidr: u32) -> Option<D> {
+        self.ips
+            .remove(IpNetwork::new_truncate(key, cidr as u8).expect("cidr is valid length"))
+    }
 }
 
 pub struct Iter<'a, D: 'a>(VecDeque<(&'a D, IpAddr, u8)>);

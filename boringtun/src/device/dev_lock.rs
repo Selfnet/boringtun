@@ -4,6 +4,23 @@
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::ops::Deref;
 
+struct WantsWriteReset<'a> {
+    wants_write: &'a (Mutex<bool>, Condvar),
+}
+
+impl Drop for WantsWriteReset<'_> {
+    fn drop(&mut self) {
+        let (lock, cvar) = self.wants_write;
+
+        {
+            let mut wants_write = lock.lock();
+            *wants_write = false;
+        }
+
+        cvar.notify_all();
+    }
+}
+
 /// A special type of read/write lock, that makes the following assumptions:
 /// a) Read access is frequent, and has to be very fast, so we want to hold it indefinitely
 /// b) Write access is very rare (think less than once per second) and can be a bit slower
@@ -77,6 +94,13 @@ impl<'a, T: ?Sized> LockReadGuard<'a, T> {
             });
         }
 
+        // This thread owns the write intent after the mutex guard above has
+        // been released. Clear it on every exit path, including unwinding from
+        // either callback.
+        let _wants_write_reset = WantsWriteReset {
+            wants_write: self.wants_write,
+        };
+
         // Second stage is to run the prep function
         prep_func(&*self.inner);
 
@@ -89,12 +113,6 @@ impl<'a, T: ?Sized> LockReadGuard<'a, T> {
             mut_func(&mut *write_access)
         }));
 
-        // Finally signal other threads
-        let (ref lock, ref cvar) = &self.wants_write;
-        let mut wants_write = lock.lock();
-        *wants_write = false;
-        cvar.notify_all();
-
         ret
     }
 }
@@ -104,5 +122,37 @@ impl<'a, T: ?Sized> Deref for LockReadGuard<'a, T> {
 
     fn deref(&self) -> &T {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn write_intent_is_reset_when_mutator_panics() {
+        let lock = Lock::new(7usize);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut guard = lock.read();
+            let _ = guard.try_writeable(|_| {}, |_| panic!("test panic"));
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(*lock.read(), 7);
+    }
+
+    #[test]
+    fn write_intent_is_reset_when_preparation_panics() {
+        let lock = Lock::new(7usize);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut guard = lock.read();
+            let _ = guard.try_writeable(|_| panic!("test panic"), |_| {});
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(*lock.read(), 7);
     }
 }
